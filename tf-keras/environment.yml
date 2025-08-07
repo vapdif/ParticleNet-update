@@ -1,0 +1,23 @@
+name: particlenet
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - cudatoolkit
+  - cudnn
+  - pip
+  - pip:
+      - tensorflow
+      - keras
+      - numpy
+      - scipy
+      - h5py
+      - scikit-learn
+      - jupyterlab
+      - matplotlib
+      - pandas
+      - awkward
+      - uproot
+      - vector
+      - pytables
