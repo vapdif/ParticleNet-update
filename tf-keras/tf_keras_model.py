@@ -41,14 +41,48 @@ def edge_conv(points, features, num_points, K, channels, with_bn=True, activatio
     with tf.name_scope('edgeconv'):
 
         # distance
+        """
         D = batch_distance_matrix_general(points, points)  # (N, P, P)
         _, indices = tf.nn.top_k(-D, k=K + 1)  # (N, P, K+1)
-        indices = indices[:, :, 1:]  # (N, P, K)
+        indices = indices[:, :, 1:]  # (N, P, K)"""
+
+        # distance (usar Lambda para KerasTensor)
+        D = keras.layers.Lambda(
+            lambda ab: batch_distance_matrix_general(ab[0], ab[1]),
+            name=f'{name}_dmat'
+        )([points, points])  # (N, P, P)
+        # top-k vecinos (omitimos el self-index en [:, :, 0])
+        indices = keras.layers.Lambda(
+            lambda d: tf.nn.top_k(-d, k=K + 1).indices[:, :, 1:],
+            name=f'{name}_topk_idx'
+        )(D)  # (N, P, K)
 
         fts = features
-        knn_fts = knn(num_points, K, indices, fts)  # (N, P, K, C)
-        knn_fts_center = tf.tile(tf.expand_dims(fts, axis=2), (1, 1, K, 1))  # (N, P, K, C)
-        knn_fts = tf.concat([knn_fts_center, tf.subtract(knn_fts, knn_fts_center)], axis=-1)  # (N, P, K, 2*C)
+
+        def _knn_outshape(shapes):
+            # shapes[0] es fts: (batch, P, C)
+            fshape = shapes[0]
+            # Devuelve (batch, P, K, C)
+            return (fshape[0], fshape[1], K, fshape[2])
+
+        #knn_fts = knn(num_points, K, indices, fts)  # (N, P, K, C)
+        knn_fts = keras.layers.Lambda(
+            lambda x: knn(num_points, K, x[1], x[0]),
+            output_shape=_knn_outshape,                 # <— clave
+            name=f'{name}_gather_knn'
+        )([fts, indices])  # (N, P, K, C)
+
+        #knn_fts_center = tf.tile(tf.expand_dims(fts, axis=2), (1, 1, K, 1))  # (N, P, K, C)
+        knn_fts_center = keras.layers.Lambda(
+            lambda t: tf.tile(tf.expand_dims(t, axis=2), (1, 1, K, 1)),
+            name=f'{name}_tile_center'
+        )(fts)  # (N, P, K, C)
+
+        #knn_fts = tf.concat([knn_fts_center, tf.subtract(knn_fts, knn_fts_center)], axis=-1)  # (N, P, K, 2*C)
+        knn_fts = keras.layers.Lambda(
+            lambda xy: tf.concat([xy[0], tf.subtract(xy[1], xy[0])], axis=-1),
+            name=f'{name}_edge_feat'
+        )([knn_fts_center, knn_fts])  # (N, P, K, 2*C)
 
         x = knn_fts
         for idx, channel in enumerate(channels):
@@ -60,16 +94,23 @@ def edge_conv(points, features, num_points, K, channels, with_bn=True, activatio
                 x = keras.layers.Activation(activation, name='%s_act%d' % (name, idx))(x)
 
         if pooling == 'max':
-            fts = tf.reduce_max(x, axis=2)  # (N, P, C')
+            #fts = tf.reduce_max(x, axis=2)  # (N, P, C')
+            fts = keras.layers.Lambda(lambda t: tf.reduce_max(t, axis=2), name=f'{name}_pool_max')(x)
         else:
-            fts = tf.reduce_mean(x, axis=2)  # (N, P, C')
+            #fts = tf.reduce_mean(x, axis=2)  # (N, P, C')
+            fts = keras.layers.Lambda(lambda t: tf.reduce_mean(t, axis=2), name=f'{name}_pool_avg')(x)
 
         # shortcut
+        #sc = keras.layers.Conv2D(channels[-1], kernel_size=(1, 1), strides=1, data_format='channels_last',
+        #                         use_bias=False if with_bn else True, kernel_initializer='glorot_normal', name='%s_sc_conv' % name)(tf.expand_dims(features, axis=2))
+        sc_in = keras.layers.Lambda(lambda t: tf.expand_dims(t, axis=2), name=f'{name}_sc_expand')(features)
         sc = keras.layers.Conv2D(channels[-1], kernel_size=(1, 1), strides=1, data_format='channels_last',
-                                 use_bias=False if with_bn else True, kernel_initializer='glorot_normal', name='%s_sc_conv' % name)(tf.expand_dims(features, axis=2))
+                                 use_bias=False if with_bn else True, kernel_initializer='glorot_normal', name='%s_sc_conv' % name)(sc_in)
+        
         if with_bn:
             sc = keras.layers.BatchNormalization(name='%s_sc_bn' % name)(sc)
-        sc = tf.squeeze(sc, axis=2)
+        #sc = tf.squeeze(sc, axis=2)
+        sc = keras.layers.Lambda(lambda t: tf.squeeze(t, axis=2), name=f'{name}_sc_squeeze')(sc)
 
         if activation:
             return keras.layers.Activation(activation, name='%s_sc_act' % name)(sc + fts)  # (N, P, C')
@@ -87,20 +128,45 @@ def _particle_net_base(points, features=None, mask=None, setting=None, name='par
             features = points
 
         if mask is not None:
-            mask = tf.cast(tf.not_equal(mask, 0), dtype='float32')  # 1 if valid
-            coord_shift = tf.multiply(999., tf.cast(tf.equal(mask, 0), dtype='float32'))  # make non-valid positions to 99
+            #mask = tf.cast(tf.not_equal(mask, 0), dtype='float32')  # 1 if valid
+            #coord_shift = tf.multiply(999., tf.cast(tf.equal(mask, 0), dtype='float32'))  # make non-valid positions to 99
+            # Keras 3: envolver ops de TF en capas Lambda para usarlas con KerasTensor
+            mask_valid = keras.layers.Lambda(lambda m: tf.cast(tf.not_equal(m, 0), tf.float32),
+                                             name=f'{name}_mask_valid')(mask)
+            coord_shift = keras.layers.Lambda(lambda m: 999. * tf.cast(tf.equal(m, 0), tf.float32),
+                                              name=f'{name}_coord_shift')(mask)
+        else:
+            mask_valid = None
+            # Si no hay máscara, usar cero como desplazamiento
+            coord_shift = keras.layers.Lambda(lambda x: tf.zeros_like(x), name=f'{name}_zero_shift')(points)
 
-        fts = tf.squeeze(keras.layers.BatchNormalization(name='%s_fts_bn' % name)(tf.expand_dims(features, axis=2)), axis=2)
+
+        #fts = tf.squeeze(keras.layers.BatchNormalization(name='%s_fts_bn' % name)(tf.expand_dims(features, axis=2)), axis=2)
+        # tf.squeeze sobre KerasTensor -> Lambda
+        fts = keras.layers.BatchNormalization(name=f'{name}_fts_bn')(
+            keras.layers.Lambda(lambda t: tf.expand_dims(t, axis=2), name=f'{name}_fts_expand')(features)
+        )
+        fts = keras.layers.Lambda(lambda t: tf.squeeze(t, axis=2), name=f'{name}_fts_squeeze')(fts)
+
         for layer_idx, layer_param in enumerate(setting.conv_params):
             K, channels = layer_param
-            pts = tf.add(coord_shift, points) if layer_idx == 0 else tf.add(coord_shift, fts)
+            #pts = tf.add(coord_shift, points) if layer_idx == 0 else tf.add(coord_shift, fts)
+            # tf.add -> capa Add()
+            pts = keras.layers.Add(name=f'{name}_add_pts_{layer_idx}')(
+                [coord_shift, points if layer_idx == 0 else fts]
+            )
+
             fts = edge_conv(pts, fts, setting.num_points, K, channels, with_bn=True, activation='relu',
                             pooling=setting.conv_pooling, name='%s_%s%d' % (name, 'EdgeConv', layer_idx))
 
         if mask is not None:
-            fts = tf.multiply(fts, mask)
+            #fts = tf.multiply(fts, mask)
+            # tf.multiply -> capa Multiply()
+            fts = keras.layers.Multiply(name=f'{name}_apply_mask')([fts, mask_valid])
 
-        pool = tf.reduce_mean(fts, axis=1)  # (N, C)
+        #pool = tf.reduce_mean(fts, axis=1)  # (N, C)
+        # tf.reduce_mean -> Lambda
+        pool = keras.layers.Lambda(lambda t: tf.reduce_mean(t, axis=1), name=f'{name}_global_avg')(fts)
 
         if setting.fc_params is not None:
             x = pool

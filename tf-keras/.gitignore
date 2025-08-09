@@ -6,3 +6,4 @@ tf-keras/original/validation.h5
 
 *.h5
 
+*.parquet

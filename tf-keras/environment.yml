@@ -4,6 +4,7 @@ channels:
   - defaults
 dependencies:
   - python
+  - pytables
   - cudatoolkit
   - cudnn
   - pip
